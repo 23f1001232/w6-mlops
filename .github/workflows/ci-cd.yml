@@ -2,14 +2,15 @@ name: Build → Push → Deploy to GKE
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
 
 env:
-  PROJECT_ID: ${{ secrets.GCP_PROJECT }}
-  REGION: ${{ secrets.GCP_REGION }}
-  REPOSITORY: ${{ secrets.ARTIFACT_REGISTRY_REPOSITORY }}
-  IMAGE: ${{ secrets.IMAGE_NAME }}
+  PROJECT_ID: vivid-science-473308-m7       # your project id
+  REGION: us-central1                       # artifact registry region
+  REPOSITORY: my-repo                       # artifact registry repo
+  IMAGE_NAME: iris-api
+  GKE_CLUSTER: autopilot-cluster-1
+  GKE_LOCATION: us-central1                 # region for Autopilot cluster
 
 jobs:
   build-and-deploy:
@@ -18,36 +19,58 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Cloud SDK
+      - name: Authenticate to GCP
+        # This authenticates the runner using the service account JSON stored in GitHub Secrets
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up gcloud & kubectl
         uses: google-github-actions/setup-gcloud@v1
         with:
-          service_account_key: ${{ secrets.GCP_SA_KEY }}
-          project_id: ${{ secrets.GCP_PROJECT }}
+          project_id: ${{ env.PROJECT_ID }}
+          install_components: kubectl
 
-      - name: Configure Docker to use gcloud credential helper for Artifact Registry
+      - name: Configure Docker credential helper for Artifact Registry
         run: |
+          # configure-docker accepts <LOCATION>-docker.pkg.dev
           gcloud auth configure-docker ${REGION}-docker.pkg.dev --quiet
 
-      - name: Build Docker image
+      - name: Build and push Docker image
+        env:
+          PROJECT_ID: ${{ env.PROJECT_ID }}
+          REGION: ${{ env.REGION }}
+          REPOSITORY: ${{ env.REPOSITORY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
         run: |
-          SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
-          IMAGE_URI="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/${IMAGE}:${SHORT_SHA}"
+          SHORT_SHA=${GITHUB_SHA::7}
+          IMAGE_URI="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/${IMAGE_NAME}:${SHORT_SHA}"
           echo "IMAGE_URI=${IMAGE_URI}" >> $GITHUB_ENV
-          docker build -t ${IMAGE_URI} .
-          docker push ${IMAGE_URI}
+          echo "Building ${IMAGE_URI}"
+          docker build -t "${IMAGE_URI}" .
+          docker push "${IMAGE_URI}"
 
       - name: Get GKE credentials
+        env:
+          PROJECT_ID: ${{ env.PROJECT_ID }}
+          GKE_CLUSTER: ${{ env.GKE_CLUSTER }}
+          GKE_LOCATION: ${{ env.GKE_LOCATION }}
         run: |
-          gcloud container clusters get-credentials ${{ secrets.GKE_CLUSTER }} --zone ${{ secrets.GKE_ZONE }} --project ${{ secrets.GCP_PROJECT }}
+          # For Autopilot/regional clusters, use --region; for zonal use --zone
+          gcloud container clusters get-credentials "${GKE_CLUSTER}" --region "${GKE_LOCATION}" --project "${PROJECT_ID}"
 
-      - name: Deploy to GKE (kubectl set image & rollout)
+      - name: Apply k8s manifests (ensure resources exist)
         run: |
-          # update deployment image
-          kubectl set image deployment/iris-deployment iris-api=${{ env.IMAGE_URI }} --namespace=default
+          kubectl apply -f k8s/deployment.yaml || true
+          kubectl apply -f k8s/service.yaml || true
+
+      - name: Update deployment image and wait for rollout
+        run: |
+          # IMAGE_URI was exported to GITHUB_ENV earlier
+          kubectl set image deployment/iris-deployment iris-api="${IMAGE_URI}" --record
           kubectl rollout status deployment/iris-deployment --timeout=180s
 
-      - name: Expose service info
+      - name: Show service info
         run: |
-          kubectl get svc iris-service -o wide
-          kubectl get deployment iris-deployment -o wide
-
+          kubectl get pods -l app=iris -o wide || true
+          kubectl get svc iris-service -o wide || true
