@@ -5,12 +5,15 @@ on:
     branches: [ main ]
 
 env:
-  PROJECT_ID: vivid-science-473308-m7       # your project id
-  REGION: us-central1                       # artifact registry region
-  REPOSITORY: my-repo                       # artifact registry repo
+  PROJECT_ID: vivid-science-473308-m7
+  REGION: us-central1
+  REPOSITORY: my-repo
   IMAGE_NAME: iris-api
   GKE_CLUSTER: autopilot-cluster-1
-  GKE_LOCATION: us-central1                 # region for Autopilot cluster
+  GKE_LOCATION: us-central1   # use --region for Autopilot regional clusters
+  DEPLOYMENT_NAME: iris-deployment
+  CONTAINER_NAME: iris-api
+  K8S_MANIFEST_DIR: k8s
 
 jobs:
   build-and-deploy:
@@ -20,20 +23,19 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Authenticate to GCP
-        # This authenticates the runner using the service account JSON stored in GitHub Secrets
         uses: google-github-actions/auth@v1
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Set up gcloud & kubectl
+      - name: Setup gcloud and kubectl
         uses: google-github-actions/setup-gcloud@v1
         with:
           project_id: ${{ env.PROJECT_ID }}
           install_components: kubectl
 
-      - name: Configure Docker credential helper for Artifact Registry
+      - name: Configure docker for Artifact Registry
         run: |
-          # configure-docker accepts <LOCATION>-docker.pkg.dev
+          echo "Configuring docker credential helper for ${REGION}-docker.pkg.dev"
           gcloud auth configure-docker ${REGION}-docker.pkg.dev --quiet
 
       - name: Build and push Docker image
@@ -49,6 +51,8 @@ jobs:
           echo "Building ${IMAGE_URI}"
           docker build -t "${IMAGE_URI}" .
           docker push "${IMAGE_URI}"
+          # verify
+          docker inspect "${IMAGE_URI}" || true
 
       - name: Get GKE credentials
         env:
@@ -56,21 +60,34 @@ jobs:
           GKE_CLUSTER: ${{ env.GKE_CLUSTER }}
           GKE_LOCATION: ${{ env.GKE_LOCATION }}
         run: |
-          # For Autopilot/regional clusters, use --region; for zonal use --zone
+          # For Autopilot / regional clusters use --region; for zonal clusters use --zone
           gcloud container clusters get-credentials "${GKE_CLUSTER}" --region "${GKE_LOCATION}" --project "${PROJECT_ID}"
 
-      - name: Apply k8s manifests (ensure resources exist)
+      - name: (Optional) Patch deployment resources for Autopilot / quick scheduling
         run: |
-          kubectl apply -f k8s/deployment.yaml || true
-          kubectl apply -f k8s/service.yaml || true
+          # If you want to ensure Autopilot will schedule, the deployment's container should request small resources.
+          # This command patches the Kubernetes deployment *before* updating image (idempotent).
+          kubectl -n default patch deployment "${DEPLOYMENT_NAME}" --type='json' -p='[{
+            "op":"replace","path":"/spec/template/spec/containers/0/resources",
+            "value":{"requests":{"cpu":"50m","memory":"64Mi"},"limits":{"cpu":"250m","memory":"256Mi"}}
+          }]' || true
+
+      - name: Apply k8s manifests (create svc/deploy if not present)
+        run: |
+          # apply manifests - they should define deployment/service using placeholders or be generic
+          kubectl apply -f ${K8S_MANIFEST_DIR}/deployment.yaml
+          kubectl apply -f ${K8S_MANIFEST_DIR}/service.yaml
 
       - name: Update deployment image and wait for rollout
+        env:
+          IMAGE_URI: ${{ env.IMAGE_URI }}
         run: |
-          # IMAGE_URI was exported to GITHUB_ENV earlier
-          kubectl set image deployment/iris-deployment iris-api="${IMAGE_URI}" --record
-          kubectl rollout status deployment/iris-deployment --timeout=180s
+          # use the IMAGE_URI set earlier in the job
+          echo "Setting image for deployment ${DEPLOYMENT_NAME} to ${IMAGE_URI}"
+          kubectl -n default set image deployment/${{ env.DEPLOYMENT_NAME }} ${CONTAINER_NAME}=${IMAGE_URI} --record
+          kubectl -n default rollout status deployment/${{ env.DEPLOYMENT_NAME }} --timeout=240s
 
-      - name: Show service info
+      - name: Verify pods and service
         run: |
-          kubectl get pods -l app=iris -o wide || true
-          kubectl get svc iris-service -o wide || true
+          kubectl -n default get pods -l app=iris -o wide
+          kubectl -n default get svc iris-service -o wide || true
